@@ -66,19 +66,27 @@ pub fn read_f64(s: &[u8]) -> f64 {
 }
 
 /// Push literal column into a String buffer
-pub fn push_column(mut col: u32, buf: &mut String) {
-    if col < 26 {
-        buf.push((b'A' + col as u8) as char);
-    } else {
-        let mut rev = String::new();
-        while col >= 26 {
-            let c = col % 26;
-            rev.push((b'A' + c as u8) as char);
-            col -= c;
-            col /= 26;
-        }
-        buf.extend(rev.chars().rev());
+pub fn push_column(col: u32, buf: &mut String) {
+    let mut digits = [0u8; 7];
+    let len = column_name_digits(col, &mut digits);
+    for &d in &digits[..len] {
+        buf.push(d as char);
     }
+}
+
+/// Write the Excel letters for a 0-based column index into `out` (most
+/// significant first) and return how many were written.
+pub(crate) fn column_name_digits(col: u32, out: &mut [u8]) -> usize {
+    let mut num = col + 1;
+    let mut n = 0;
+    while num > 0 {
+        out[n] = b'A' + ((num - 1) % 26) as u8;
+        n += 1;
+        num = (num - 1) / 26;
+    }
+    // digits were collected least-significant first
+    out[..n].reverse();
+    n
 }
 
 // Utility function to unescape standard XML entities or character references

@@ -3225,6 +3225,28 @@ fn vba_optional_records_581() {
 }
 
 #[test]
+fn xls_shared_formulas_replay_shrfmla_tokens() {
+    // Excel keeps a shared formula group's tokens in a SHRFMLA record and
+    // every member's FORMULA record carries a lone PtgExp pointing at the
+    // master. Replaying the record's PtgRefN tokens must anchor the
+    // references at each member, not at the master.
+    let mut excel: Xls<_> = wb("optional_records.xls");
+    let formula = excel.worksheet_formula("Orig Sched").unwrap();
+
+    // Master (M10) and two slaves of the N10/1000 group.
+    assert_eq!(formula.get_value((9, 12)), Some(&"N10/1000".to_string()));
+    assert_eq!(formula.get_value((10, 12)), Some(&"N11/1000".to_string()));
+    assert_eq!(formula.get_value((35, 12)), Some(&"N36/1000".to_string()));
+
+    // The two single-reference groups: master, mid-group and last member.
+    assert_eq!(formula.get_value((10, 26)), Some(&"N11".to_string()));
+    assert_eq!(formula.get_value((11, 26)), Some(&"N12".to_string()));
+    assert_eq!(formula.get_value((73, 26)), Some(&"N74".to_string()));
+    assert_eq!(formula.get_value((74, 26)), Some(&"N75".to_string()));
+    assert_eq!(formula.get_value((91, 26)), Some(&"N92".to_string()));
+}
+
+#[test]
 fn biff5_defined_names_and_empty_sheets_612() {
     // covers a parsing error where biff8 byte layout was assumed
     // ref: https://github.com/tafia/calamine/issues/612
