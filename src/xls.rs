@@ -1478,6 +1478,43 @@ fn write_absolute_cell_ref(f: &mut String, col: u32, row: u32) {
     write!(f, "${}", row + 1).unwrap();
 }
 
+/// A sheet reference as the A1 grammar wants it, exclamation mark included.
+/// A name the grammar could otherwise misread — spaces, operators, a leading
+/// digit, one shaped like a cell reference — goes in single quotes, which the
+/// grammar accepts unconditionally.
+fn push_sheet(sh: &str, formula: &mut String) {
+    if sh == "#REF" {
+        formula.push_str(sh);
+    } else if sheet_needs_quotes(sh) {
+        formula.push('\'');
+        for c in sh.chars() {
+            // a literal quote inside a quoted name doubles up
+            if c == '\'' {
+                formula.push('\'');
+            }
+            formula.push(c);
+        }
+        formula.push('\'');
+    } else {
+        formula.push_str(sh);
+    }
+    formula.push('!');
+}
+
+/// The A1 grammar takes a bare name as a sheet only when it starts with a
+/// letter or underscore, keeps to letters, digits and underscores, and does
+/// not double as a cell reference like `A1` or `XFD99`.
+fn sheet_needs_quotes(sh: &str) -> bool {
+    let plain = sh.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && sh.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !plain {
+        return true;
+    }
+    let letters = sh.chars().take_while(|c| c.is_ascii_alphabetic()).count();
+    let digits = &sh[letters..];
+    (1..=3).contains(&letters) && !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// Formula parsing
 ///
 /// Does not implement ALL possibilities, only Area are parsed
@@ -1627,17 +1664,27 @@ fn parse_formula(
                     .and_then(|xti| sheets.get(xti.itab_first as usize))
                     .map_or("#REF", |sh| sh);
                 stack.push(formula.len());
-                formula.push_str(sh);
-                formula.push('!');
+                push_sheet(sh, &mut formula);
                 // The column field is 14 bits of column plus two relative
                 // flags: bit 15 = row relative, bit 14 = column relative
-                // ([MS-XLS] 2.5.257 PtgRef3d).
-                let (row, col) = match offset {
-                    Some((dr, dc)) => (
+                // ([MS-XLS] 2.5.257 PtgRef3d). Inside a shared formula the
+                // relative components are offsets from the cell replaying
+                // the tokens ([MS-XLS] 2.5.198.6), so they anchor at `base`.
+                let (row, col) = match (offset, base) {
+                    (Some((dr, dc)), _) => (
                         shift_relative(rowu as u32, colu & 0x8000 != 0, dr),
                         shift_relative((colu & 0x3FFF) as u32, colu & 0x4000 != 0, dc),
                     ),
-                    None => (rowu as u32, (colu & 0x3FFF) as u32),
+                    (None, Some((brow, bcol))) => (
+                        anchor_relative(rowu as u32, colu & 0x8000 != 0, brow, u16::MAX as u32),
+                        anchor_relative(
+                            (colu & 0x3FFF) as u32,
+                            colu & 0x4000 != 0,
+                            bcol,
+                            u8::MAX as u32,
+                        ),
+                    ),
+                    (None, None) => (rowu as u32, (colu & 0x3FFF) as u32),
                 };
                 if colu & 0x4000 == 0 {
                     formula.push('$');
@@ -1652,23 +1699,92 @@ fn parse_formula(
             0x3b | 0x5b | 0x7b => {
                 // PtgArea3d
                 let ixti = read_u16(&rgce[0..2]);
+                let row_first = read_u16(&rgce[2..4]);
+                let row_last = read_u16(&rgce[4..6]);
+                let col_first = read_u16(&rgce[6..8]);
+                let col_last = read_u16(&rgce[8..10]);
+                let sh = xtis
+                    .get(ixti as usize)
+                    .and_then(|xti| sheets.get(xti.itab_first as usize))
+                    .map_or("#REF", |sh| sh);
                 stack.push(formula.len());
-                formula.push_str(sheets.get(ixti as usize).map_or("#REF", |s| &**s));
-                formula.push('!');
-                // TODO: check with relative columns
-                formula.push('$');
-                push_column(read_u16(&rgce[6..8]) as u32, &mut formula);
-                write!(&mut formula, "${}:$", read_u16(&rgce[2..4]) as u32 + 1).unwrap();
-                push_column(read_u16(&rgce[8..10]) as u32, &mut formula);
-                write!(&mut formula, "${}", read_u16(&rgce[4..6]) as u32 + 1).unwrap();
+                push_sheet(sh, &mut formula);
+                // Each corner's column field is 14 bits of column plus two
+                // relative flags, laid out like PtgRef3d's; the corners anchor
+                // at the replaying cell the same way ([MS-XLS] 2.5.258).
+                let (row_first, col_first_v) = match (offset, base) {
+                    (Some((dr, dc)), _) => (
+                        shift_relative(row_first as u32, col_first & 0x8000 != 0, dr),
+                        shift_relative(
+                            (col_first & 0x3FFF) as u32,
+                            col_first & 0x4000 != 0,
+                            dc,
+                        ),
+                    ),
+                    (None, Some((brow, bcol))) => (
+                        anchor_relative(
+                            row_first as u32,
+                            col_first & 0x8000 != 0,
+                            brow,
+                            u16::MAX as u32,
+                        ),
+                        anchor_relative(
+                            (col_first & 0x3FFF) as u32,
+                            col_first & 0x4000 != 0,
+                            bcol,
+                            u8::MAX as u32,
+                        ),
+                    ),
+                    (None, None) => (row_first as u32, (col_first & 0x3FFF) as u32),
+                };
+                let (row_last, col_last_v) = match (offset, base) {
+                    (Some((dr, dc)), _) => (
+                        shift_relative(row_last as u32, col_last & 0x8000 != 0, dr),
+                        shift_relative((col_last & 0x3FFF) as u32, col_last & 0x4000 != 0, dc),
+                    ),
+                    (None, Some((brow, bcol))) => (
+                        anchor_relative(
+                            row_last as u32,
+                            col_last & 0x8000 != 0,
+                            brow,
+                            u16::MAX as u32,
+                        ),
+                        anchor_relative(
+                            (col_last & 0x3FFF) as u32,
+                            col_last & 0x4000 != 0,
+                            bcol,
+                            u8::MAX as u32,
+                        ),
+                    ),
+                    (None, None) => (row_last as u32, (col_last & 0x3FFF) as u32),
+                };
+                if col_first & 0x4000 == 0 {
+                    formula.push('$');
+                }
+                push_column(col_first_v, &mut formula);
+                if col_first & 0x8000 == 0 {
+                    formula.push('$');
+                }
+                write!(&mut formula, "{}:", row_first + 1).unwrap();
+                if col_last & 0x4000 == 0 {
+                    formula.push('$');
+                }
+                push_column(col_last_v, &mut formula);
+                if col_last & 0x8000 == 0 {
+                    formula.push('$');
+                }
+                write!(&mut formula, "{}", row_last + 1).unwrap();
                 rgce = &rgce[10..];
             }
             0x3c | 0x5c | 0x7c => {
                 // PtfRefErr3d
                 let ixti = read_u16(&rgce[0..2]);
                 stack.push(formula.len());
-                formula.push_str(sheets.get(ixti as usize).map_or("#REF", |s| &**s));
-                formula.push('!');
+                let sh = xtis
+                    .get(ixti as usize)
+                    .and_then(|xti| sheets.get(xti.itab_first as usize))
+                    .map_or("#REF", |sh| sh);
+                push_sheet(sh, &mut formula);
                 formula.push_str("#REF!");
                 rgce = &rgce[6..];
             }
@@ -1676,8 +1792,11 @@ fn parse_formula(
                 // PtgAreaErr3d
                 let ixti = read_u16(&rgce[0..2]);
                 stack.push(formula.len());
-                formula.push_str(sheets.get(ixti as usize).map_or("#REF", |s| &**s));
-                formula.push('!');
+                let sh = xtis
+                    .get(ixti as usize)
+                    .and_then(|xti| sheets.get(xti.itab_first as usize))
+                    .map_or("#REF", |sh| sh);
+                push_sheet(sh, &mut formula);
                 formula.push_str("#REF!");
                 rgce = &rgce[10..];
             }
@@ -2434,5 +2553,189 @@ mod formula_tests {
         // $C$7 with both components absolute: the anchor must not move it.
         let tokens = cce(&[0x4C, 0x06, 0x00, 0x02, 0x00]);
         assert_eq!(replay(&tokens, (40, 9)), "$C$7");
+    }
+
+    /// Sheets and EXTERNSHEET entries in different orders: xti 1 points at
+    /// "Data" through `itab_first`, while `sheets.get(1)` is "Elsewhere". A
+    /// 3-D token that looks the sheet up by xti position lands on the wrong
+    /// sheet.
+    fn three_d_fixtures() -> (Vec<String>, Vec<Xti>) {
+        (
+            vec![
+                "Summary".to_string(),
+                "Elsewhere".to_string(),
+                "Data".to_string(),
+            ],
+            vec![
+                Xti {
+                    _isup_book: 0,
+                    itab_first: 0,
+                    _itab_last: 0,
+                },
+                Xti {
+                    _isup_book: 0,
+                    itab_first: 2,
+                    _itab_last: 2,
+                },
+            ],
+        )
+    }
+
+    fn parse_3d(tokens: &[u8]) -> String {
+        let (sheets, xtis) = three_d_fixtures();
+        parse_formula(
+            &cce(tokens),
+            &sheets,
+            &[],
+            &xtis,
+            &encoding(),
+            Biff::Biff8,
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn area3d_targets_the_xti_sheet_and_honours_the_flags() {
+        // Relative corners read out as SUM(Data!A1:A4) — sheet through the
+        // xti, no dollars forced on, columns not read as their raw u16.
+        let tokens = [0x3B, 0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0xC0, 0x00, 0xC0];
+        assert_eq!(parse_3d(&tokens), "Data!A1:A4");
+        // Absolute corners keep their dollars.
+        let tokens = [0x3B, 0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00];
+        assert_eq!(parse_3d(&tokens), "Data!$A$1:$B$4");
+        // The control from the same sheet: a plain PtgRef3d at the same xti.
+        let tokens = [0x3A, 0x01, 0x00, 0x01, 0x00, 0x00, 0xC0];
+        assert_eq!(parse_3d(&tokens), "Data!A2");
+    }
+
+    #[test]
+    fn three_d_tokens_anchor_at_the_replaying_cell() {
+        // A SHRFMLA-record PtgRef3d: Data!A1 two columns left of the master
+        // (column offset 254 ≡ -2 mod 256), row offset 0, both relative. The
+        // filled-down group over C1:C3 must read A1, A2, A3 — not the stored
+        // offset spelled as an absolute column.
+        let (sheets, xtis) = three_d_fixtures();
+        let tokens = cce(&[0x3A, 0x01, 0x00, 0x00, 0x00, 0xFE, 0xC0]);
+        for (base_row, expected) in [(0, "Data!A1"), (1, "Data!A2"), (2, "Data!A3")] {
+            let parsed = parse_formula(
+                &tokens,
+                &sheets,
+                &[],
+                &xtis,
+                &encoding(),
+                Biff::Biff8,
+                None,
+                Some((base_row, 2)),
+            )
+            .unwrap();
+            assert_eq!(parsed, expected);
+        }
+    }
+
+    #[test]
+    fn area3d_anchors_both_corners_when_replayed() {
+        let (sheets, xtis) = three_d_fixtures();
+        // Data!A1:A4 relative to a master at C1: both column corners two to
+        // the left (254 ≡ -2), the rows relative.
+        let tokens = cce(&[0x3B, 0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0xFE, 0xC0, 0xFE, 0xC0]);
+        let parsed = parse_formula(
+            &tokens,
+            &sheets,
+            &[],
+            &xtis,
+            &encoding(),
+            Biff::Biff8,
+            None,
+            Some((1, 2)),
+        )
+        .unwrap();
+        assert_eq!(parsed, "Data!A2:A5");
+        // Absolute corners do not move, wherever they replay.
+        let tokens = cce(&[0x3B, 0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00]);
+        let parsed = parse_formula(
+            &tokens,
+            &sheets,
+            &[],
+            &xtis,
+            &encoding(),
+            Biff::Biff8,
+            None,
+            Some((9, 9)),
+        )
+        .unwrap();
+        assert_eq!(parsed, "Data!$A$1:$B$4");
+    }
+
+    #[test]
+    fn three_d_references_quote_sheet_names_that_need_it() {
+        // `SUMIF(Orig Sched!$O$10:…)` is not A1; the name has to be quoted.
+        let sheets = vec!["Orig Sched".to_string()];
+        let xtis = vec![Xti {
+            _isup_book: 0,
+            itab_first: 0,
+            _itab_last: 0,
+        }];
+        let tokens = cce(&[0x3A, 0x00, 0x00, 0x09, 0x00, 0x0E, 0x00]);
+        let parsed = parse_formula(
+            &tokens,
+            &sheets,
+            &[],
+            &xtis,
+            &encoding(),
+            Biff::Biff8,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(parsed, "'Orig Sched'!$O$10");
+        // A plain name stays bare, one shaped like a cell reference does not.
+        for (name, expected) in [("Data", "Data!$O$10"), ("A1", "'A1'!$O$10")] {
+            let sheets = vec![name.to_string()];
+            let parsed = parse_formula(
+                &tokens,
+                &sheets,
+                &[],
+                &xtis,
+                &encoding(),
+                Biff::Biff8,
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(parsed, expected);
+        }
+    }
+
+    #[test]
+    fn three_d_error_tokens_target_the_xti_sheet() {
+        let (sheets, xtis) = three_d_fixtures();
+        let ref_err = cce(&[0x3C, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        let parsed = parse_formula(
+            &ref_err,
+            &sheets,
+            &[],
+            &xtis,
+            &encoding(),
+            Biff::Biff8,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(parsed, "Data!#REF!");
+        let area_err = cce(&[0x3D, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        let parsed = parse_formula(
+            &area_err,
+            &sheets,
+            &[],
+            &xtis,
+            &encoding(),
+            Biff::Biff8,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(parsed, "Data!#REF!");
     }
 }
